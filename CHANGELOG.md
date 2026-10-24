@@ -9,6 +9,29 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 This file is generated from the commit history by [git-cliff](https://git-cliff.org)
 — do not edit it by hand (see `cliff.toml`).
 
+## [0.1.0-alpha.9](https://github.com/mkb79/audible-rs/compare/v0.1.0-alpha.8..v0.1.0-alpha.9) - 2026-10-24
+
+### Added
+
+- *login*: Sign in with an Amazon device code ([#131](https://github.com/mkb79/audible-rs/pull/131)) ([538b0b1](https://github.com/mkb79/audible-rs/commit/538b0b1c3362a8c722e75dd216c1d256026758c8))
+- *android*: Build and run in Termux (native-tls on Android) ([#130](https://github.com/mkb79/audible-rs/pull/130)) ([6362b73](https://github.com/mkb79/audible-rs/commit/6362b736c58d3431212b1f8d0f9ee726ee601411))
+- *api*: Export the client's current auth state ([#124](https://github.com/mkb79/audible-rs/pull/124)) ([4f4dde3](https://github.com/mkb79/audible-rs/commit/4f4dde3f95d3d89edb1d8c3ec39741cf2421f7f0))
+- *plugins*: AUDIBLE_PYTHON pins the Tier-B interpreter ([#102](https://github.com/mkb79/audible-rs/pull/102)) ([fda1031](https://github.com/mkb79/audible-rs/commit/fda103109a1038e3e65ad881498977008172335b))
+- *windows*: Dispatch native (.exe) plugins by their bare name ([#100](https://github.com/mkb79/audible-rs/pull/100)) ([44135e9](https://github.com/mkb79/audible-rs/commit/44135e9d80f649f779edb4dc65ae17d972f6527b))
+- *windows*: Find the Python interpreter for Tier-B plugins ([#99](https://github.com/mkb79/audible-rs/pull/99)) ([a2ac92b](https://github.com/mkb79/audible-rs/commit/a2ac92bd3a334d25a2570febf15fa16d5d1fe5e0))
+- *windows*: Serve the ephemeral plugin broker over a named pipe ([#98](https://github.com/mkb79/audible-rs/pull/98)) ([5da1cd3](https://github.com/mkb79/audible-rs/commit/5da1cd365d57af3dfb82c90d8c596e1d80a30458))
+- **BREAKING:** *cli*: Remove the deprecated podcasts noun ([#96](https://github.com/mkb79/audible-rs/pull/96)) ([5a28f50](https://github.com/mkb79/audible-rs/commit/5a28f507072022ae7fd7f95a62e3bdc5e515d678))
+
+### Fixed
+
+- *db*: Stop db reset and db restore from destroying data behind your back ([#110](https://github.com/mkb79/audible-rs/pull/110)) ([c74fb24](https://github.com/mkb79/audible-rs/commit/c74fb2448eb8a921aaa1af82aa5fb49bbbe109b9))
+- *self*: Add read timeout to github_get so self check cannot hang ([#129](https://github.com/mkb79/audible-rs/pull/129)) ([d32f34a](https://github.com/mkb79/audible-rs/commit/d32f34ac18d9f8e7709f238ec5e2c021562fce54))
+- *download*: Keep the orphan scan from aborting on a briefly locked database ([#105](https://github.com/mkb79/audible-rs/pull/105)) ([7910fb6](https://github.com/mkb79/audible-rs/commit/7910fb6f10c570e637272b00e193726d235af5e8))
+
+### Security
+
+- *security*: Update rustls to 0.23.46 (GHSA-2mjx-qc3c-rqvc) ([#132](https://github.com/mkb79/audible-rs/pull/132)) ([6b8e867](https://github.com/mkb79/audible-rs/commit/6b8e86714d1363cf60fc358038131145ffeba562))
+
 ## [0.1.0-alpha.8](https://github.com/mkb79/audible-rs/compare/v0.1.0-alpha.7..v0.1.0-alpha.8) - 2026-07-19
 
 ### Added
