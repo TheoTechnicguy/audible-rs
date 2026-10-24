@@ -1,32 +1,50 @@
 //! `account login` and `account login server`: the live sign-in flows
-//! plus their terminal UI (challenge prompts, QR code, captcha display).
+//! plus their terminal UI (the device-code prompt, challenge prompts, QR
+//! code, captcha display).
 
 use anyhow::{Result, bail};
 use clap::Args;
 use zeroize::Zeroizing;
 
-use crate::api::locale;
+use crate::api::locale::{self, Locale};
+use crate::auth::Authenticator;
 use crate::auth::device::{Device, DeviceKind};
 use crate::auth::login as login_flow;
 use crate::config::ctx::Ctx;
 
 use super::*;
 
-/// Register a new account via a live sign-in. Default: the scripted (internal)
-/// login that prompts for email + password and handles challenges in the
-/// terminal. `--external` instead prints the sign-in URL for your browser and
-/// reads back the redirect (no password entered here). `--audible-username`
-/// signs in with a pre-merger Audible username (DE/US/UK) on the Audible
-/// domain instead of an Amazon email.
+/// Register a new account via a live sign-in. Default: the device-code
+/// sign-in (mkb79/Audible#906) — a short code you confirm at
+/// `amazon.<tld>/code` in any browser; your password never passes through
+/// this program. `--external` prints the sign-in URL for your browser and
+/// reads back the redirect — the flow pre-merger Audible accounts
+/// (`--audible-username`, DE/US/UK) always take, as they have no Amazon
+/// sign-in. `--password` is the deprecated scripted login that asks for
+/// email + password here and answers challenges in the terminal — kept only
+/// as a fallback in case the device code does not work everywhere.
 #[derive(Debug, Args)]
 pub(super) struct LoginArgs {
-    /// Use the external-browser flow (print the URL, paste the redirect)
-    /// instead of entering your password here
+    /// Use the browser-URL flow instead of the device code: print the sign-in
+    /// URL for your browser, paste the redirect back here
     #[arg(long, alias = "link", help_heading = "Sign-in method")]
     external: bool,
 
+    /// Deprecated: type your email + password here (the scripted login, with
+    /// CAPTCHA/OTP prompts in the terminal). Only a fallback in case the
+    /// device code does not work for you; breaks whenever Amazon changes its
+    /// sign-in pages
+    #[arg(
+        long,
+        alias = "scripted",
+        conflicts_with = "external",
+        help_heading = "Sign-in method"
+    )]
+    password: bool,
+
     /// Sign in with an Audible username (pre-merger accounts) instead of an
-    /// Amazon email; routes the flow to the Audible domain. DE, US and UK only
+    /// Amazon email; routes the browser-URL flow to the Audible domain. DE, US
+    /// and UK only
     #[arg(long, alias = "with-username", help_heading = "Sign-in method")]
     audible_username: bool,
 
@@ -93,6 +111,10 @@ pub(super) struct ServerArgs {
     reg: RegistrationArgs,
 }
 
+/// Per-request timeout of the device-code HTTP client: a stalled poll is
+/// retried like any other failure instead of hanging past the code's expiry.
+const DEVICE_CODE_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 pub(super) async fn login(ctx: &Ctx, args: LoginArgs) -> Result<()> {
     // The registration marketplace comes from -m (a single cc) — there is no
     // account yet to resolve a marketplace set against.
@@ -111,7 +133,6 @@ pub(super) async fn login(ctx: &Ctx, args: LoginArgs) -> Result<()> {
         None => DeviceKind::DEFAULT,
     };
     let device = Device::generate(kind);
-    let pkce = login_flow::Pkce::generate();
 
     if args.audible_username && !login_flow::username_login_supported(&locale) {
         bail!(
@@ -120,38 +141,23 @@ pub(super) async fn login(ctx: &Ctx, args: LoginArgs) -> Result<()> {
         );
     }
 
-    let auth = if args.external {
-        let url = login_flow::authorize_url(&device, &pkce, &locale, args.audible_username);
-        eprintln!(
-            "Open this URL in your browser and sign in. When the page goes blank \
-             (a \"page not found\" at .../ap/maplanding), copy the full address-bar URL:\n\n{url}\n"
+    let auth = if args.password {
+        ctx.warn(
+            "password_login_deprecated",
+            "--password is deprecated: the scripted login is only a fallback in case \
+             the device code does not work for you (run `audible account login` \
+             without it)",
         );
-        let redirect = prompt_required("Paste the redirect URL")?;
-        let code = login_flow::extract_authorization_code(&redirect)?;
-        let http = reqwest::Client::builder()
-            .connect_timeout(crate::api::client::CONNECT_TIMEOUT)
-            .build()?;
-        login_flow::register(&http, &locale, &device, &pkce, &code, args.audible_username).await?
+        login_scripted(&locale, &device, args.audible_username).await?
+    } else if args.external || args.audible_username {
+        if !args.external {
+            // A pre-merger account has no Amazon sign-in to confirm a device
+            // code with (mkb79/Audible#906): the browser-URL flow is its one.
+            eprintln!("Pre-merger Audible accounts sign in through the browser-URL flow.\n");
+        }
+        login_external(&locale, &device, args.audible_username).await?
     } else {
-        // Pre-merger accounts sign in with an Audible username + password.
-        let (id_label, pw_label) = if args.audible_username {
-            ("Audible username", "Audible password")
-        } else {
-            ("Amazon email", "Amazon password")
-        };
-        let username = prompt_required(id_label)?;
-        let password = Zeroizing::new(prompt_secret(pw_label)?);
-        eprintln!("Signing in to the {} marketplace…", locale.country_code);
-        login_flow::login_internal(
-            &locale,
-            &device,
-            &pkce,
-            &username,
-            &password,
-            &TerminalPrompt,
-            args.audible_username,
-        )
-        .await?
+        login_with_device_code(&locale, &device).await?
     };
     // Amazon assigns the device name (e.g. "Alice's 4th Audible for iPhone");
     // it is stored in the auth file and shown so the device can be removed.
@@ -183,11 +189,115 @@ pub(super) async fn login(ctx: &Ctx, args: LoginArgs) -> Result<()> {
     Ok(())
 }
 
+/// The device-code sign-in (the default): asks Amazon for a code, shows it
+/// together with the page to enter it on, and waits until the sign-in there
+/// has linked the device. Nothing is typed here but the account name.
+async fn login_with_device_code(locale: &Locale, device: &Device) -> Result<Authenticator> {
+    let http = reqwest::Client::builder()
+        .connect_timeout(crate::api::client::CONNECT_TIMEOUT)
+        .timeout(DEVICE_CODE_REQUEST_TIMEOUT)
+        .build()?;
+    let code_pair = login_flow::create_code_pair(&http, locale, device).await?;
+    let minutes = code_pair.time_left().as_secs().div_ceil(60).max(1);
+    eprintln!(
+        "Open this page in a browser on any device, sign in with your Amazon account and \
+         enter the code shown below:\n\n  {}\n\n  Code: {}\n",
+        login_flow::verification_url(locale),
+        code_pair.public_code()
+    );
+    eprintln!(
+        "The code is valid for about {minutes} minutes. Waiting for the sign-in to \
+         complete… (press Ctrl-C to abort)"
+    );
+    Ok(login_flow::register_with_code_pair(&http, locale, device, &code_pair).await?)
+}
+
+/// The browser-URL flow: prints the PKCE authorize URL, reads the pasted
+/// redirect back and registers with its authorization code (no password is
+/// entered here).
+async fn login_external(
+    locale: &Locale,
+    device: &Device,
+    with_username: bool,
+) -> Result<Authenticator> {
+    let pkce = login_flow::Pkce::generate();
+    let url = login_flow::authorize_url(device, &pkce, locale, with_username);
+    eprintln!(
+        "Open this URL in your browser and sign in. When the page goes blank \
+         (a \"page not found\" at .../ap/maplanding), copy the full address-bar URL:\n\n{url}\n"
+    );
+    let code = read_authorization_code()?;
+    let http = reqwest::Client::builder()
+        .connect_timeout(crate::api::client::CONNECT_TIMEOUT)
+        .build()?;
+    Ok(login_flow::register(&http, locale, device, &pkce, &code, with_username).await?)
+}
+
+/// Asks for the URL the browser ended on until it holds an authorization
+/// code (a few attempts). Terminals may cut off a long pasted line, so the
+/// path of a text file holding the URL is accepted as well.
+fn read_authorization_code() -> Result<String> {
+    const ATTEMPTS: usize = 3;
+    for attempt in 1..=ATTEMPTS {
+        let answer =
+            prompt_required("Paste the redirect URL, or the path of a text file containing it")?;
+        match authorization_code_from_answer(&answer) {
+            Ok(code) => return Ok(code),
+            Err(error) if attempt < ATTEMPTS => eprintln!("{error} — please try again."),
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("the last attempt returns")
+}
+
+/// The authorization code from a pasted redirect URL, or from the file the
+/// answer names when it is not a URL.
+fn authorization_code_from_answer(answer: &str) -> Result<String> {
+    let redirect = if answer.trim().to_ascii_lowercase().starts_with("http") {
+        answer.to_owned()
+    } else {
+        std::fs::read_to_string(answer.trim())
+            .map_err(|error| anyhow::anyhow!("cannot read {:?}: {error}", answer.trim()))?
+            .trim_start_matches('\u{feff}')
+            .to_owned()
+    };
+    Ok(login_flow::extract_authorization_code(&redirect)?)
+}
+
+/// The deprecated scripted login: email + password typed here, challenges
+/// answered in the terminal. Pre-merger accounts sign in with an Audible
+/// username + password instead.
+async fn login_scripted(
+    locale: &Locale,
+    device: &Device,
+    with_username: bool,
+) -> Result<Authenticator> {
+    let pkce = login_flow::Pkce::generate();
+    let (id_label, pw_label) = if with_username {
+        ("Audible username", "Audible password")
+    } else {
+        ("Amazon email", "Amazon password")
+    };
+    let username = prompt_required(id_label)?;
+    let password = Zeroizing::new(prompt_secret(pw_label)?);
+    eprintln!("Signing in to the {} marketplace…", locale.country_code);
+    Ok(login_flow::login_internal(
+        locale,
+        device,
+        &pkce,
+        &username,
+        &password,
+        &TerminalPrompt,
+        with_username,
+    )
+    .await?)
+}
+
 /// `account login server`: runs a local reverse-proxy so a real browser (incl.
 /// a phone via QR) completes the sign-in while we capture the code. The user
 /// first picks the marketplace/device/name/pre-merger on a small config page;
-/// the CLI flags only pre-fill it. A fallback for the scripted login and a
-/// clean path for the `br` redirect.
+/// the CLI flags only pre-fill it. An alternative to the default device code
+/// and the browser-URL flow, and a clean path for the `br` redirect.
 pub(super) async fn login_server(ctx: &Ctx, args: ServerArgs) -> Result<()> {
     // The marketplace is chosen on the config page; -m (a single cc) only
     // pre-selects it.
@@ -411,4 +521,32 @@ fn iterm2_inline_supported() -> bool {
         || std::env::var("LC_TERMINAL")
             .map(|value| value == "iTerm2")
             .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn authorization_code_comes_from_a_url_or_a_file() {
+        let url = "https://www.audible.de/ap/maplanding?openid.oa2.authorization_code=CODE1&x=y";
+        assert_eq!(authorization_code_from_answer(url).unwrap(), "CODE1");
+        assert_eq!(
+            authorization_code_from_answer(&format!("  {url}\n")).unwrap(),
+            "CODE1"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("redirect.txt");
+        std::fs::write(&file, format!("\u{feff}{url}\n")).unwrap();
+        assert_eq!(
+            authorization_code_from_answer(file.to_str().unwrap()).unwrap(),
+            "CODE1"
+        );
+
+        let missing = dir.path().join("missing.txt");
+        let error = authorization_code_from_answer(missing.to_str().unwrap()).unwrap_err();
+        assert!(error.to_string().starts_with("cannot read"), "{error}");
+        assert!(authorization_code_from_answer("https://www.audible.de/ap/maplanding").is_err());
+    }
 }

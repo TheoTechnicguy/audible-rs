@@ -1,20 +1,34 @@
-//! The `account login` OAuth/PKCE + device-registration flow (UI-free core).
+//! The `account login` sign-in + device-registration flows (UI-free core).
 //!
-//! Phase 1 (external browser, AUD-58): generate the PKCE pair and `frc`,
-//! build the authorize URL the user opens in their browser, take the pasted
-//! redirect, and register the device into an [`Authenticator`]. Captured from
-//! live iOS app traffic; secrets are never logged.
+//! Three ways to prove a sign-in, all ending in the same `POST
+//! /auth/register` that maps Amazon's response onto an [`Authenticator`]:
 //!
-//! Phase 2 (internal scripted login, AUD-59): [`metadata1`] + a form-driven
-//! sign-in with challenge handlers (added in sibling submodules).
+//! - **Device code** ([`device_code`], the default — mkb79/Audible#906): a
+//!   short code the user confirms at `amazon.<tld>/code` in any browser,
+//!   polled until Amazon links the device. The password never passes
+//!   through this program.
+//! - **External browser** (AUD-58): the PKCE pair + `frc`, the authorize
+//!   URL the user opens in their browser, and the pasted redirect's
+//!   authorization code. The one flow pre-merger Audible accounts have;
+//!   also what the `login server` reverse proxy ([`server`]) drives.
+//! - **Scripted** (AUD-59, deprecated): [`metadata1`] + a form-driven
+//!   sign-in with challenge handlers — breaks whenever Amazon changes its
+//!   pages. Kept only as a fallback in case the device code does not work
+//!   everywhere.
+//!
+//! Captured from live iOS app traffic (the browser flows) and the
+//! reference's test plugin for the issue (the device code); secrets are
+//! never logged.
 
 mod challenge;
+mod device_code;
 mod internal;
 mod metadata1;
 mod page;
 mod server;
 
 pub use challenge::{ChallengePrompt, MfaDevice};
+pub use device_code::{CodePair, create_code_pair, register_with_code_pair, verification_url};
 pub use internal::login_internal;
 pub use server::{LoginDefaults, LoginServer};
 
@@ -45,12 +59,29 @@ pub enum LoginError {
     /// The pasted redirect URL has no `openid.oa2.authorization_code`.
     #[error("the pasted URL has no authorization code (sign-in not completed?)")]
     NoAuthorizationCode,
-    /// The register endpoint answered with an error status.
-    #[error("device registration failed with HTTP status {0}")]
-    Register(reqwest::StatusCode),
+    /// The register endpoint refused the registration (status plus Amazon's
+    /// error code and message, if any).
+    #[error("device registration failed ({0})")]
+    Register(String),
     /// The register response did not have the expected shape.
     #[error("device registration returned an unexpected response")]
     RegisterResponse,
+    /// `POST /auth/create/codepair` answered with an error (status plus
+    /// Amazon's error code and message, if any).
+    #[error("requesting a device code failed ({0})")]
+    CodePair(String),
+    /// The code-pair response did not have the expected shape.
+    #[error("the device-code response had an unexpected shape")]
+    CodePairResponse,
+    /// The device code expired before the user confirmed it.
+    #[error("the device code expired before it was confirmed — run the login again for a new one")]
+    CodeExpired,
+    /// Amazon rejected the code pair (anything but "not confirmed yet").
+    #[error("Amazon rejected the device code ({0})")]
+    CodeRejected(String),
+    /// The registration came back for a different device serial.
+    #[error("the registration belongs to another device (serial mismatch)")]
+    ForeignDevice,
     /// The device private key from the registration could not be parsed.
     #[error("could not parse the device private key from the registration")]
     PrivateKey,
@@ -68,6 +99,7 @@ pub enum LoginError {
         "Amazon served an anti-automation verification page that requires JavaScript — \
          the scripted login cannot pass it (no verification code is sent). \
          Sign in through a browser instead:\n  \
+         audible account login              (device code, the default: confirm it in any browser)\n  \
          audible account login --external   (paste the redirect URL back here)\n  \
          audible account login server       (opens a local sign-in page; headless-friendly)"
     )]
@@ -230,57 +262,168 @@ pub fn extract_authorization_code(redirect: &str) -> Result<String, LoginError> 
     auth_code_from_pairs(url.query_pairs()).ok_or(LoginError::NoAuthorizationCode)
 }
 
-/// Registers the device with Amazon (`POST /auth/register`) using the OAuth
-/// `authorization_code`, and maps the response onto an [`Authenticator`] —
-/// the same envelope `account import` produces. No secrets are logged.
+/// The identity API a login registers with: `https://api.amazon.<tld>` for
+/// Amazon accounts, `https://api.audible.<tld>` for pre-merger Audible
+/// accounts (the website-cookie domain in the body stays `.amazon.<tld>`
+/// either way, matching the reference). `auth_domain` is the host the
+/// `x-amzn-identity-auth-domain` header names — the same host, except in
+/// tests, where a mock server stands in for Amazon.
+#[derive(Clone, Debug)]
+pub(crate) struct IdentityApi {
+    base_url: String,
+    auth_domain: String,
+}
+
+impl IdentityApi {
+    pub(crate) fn new(locale: &Locale, with_username: bool) -> Self {
+        let host = if with_username { "audible" } else { "amazon" };
+        let auth_domain = format!("api.{host}.{}", locale.domain);
+        Self {
+            base_url: format!("https://{auth_domain}"),
+            auth_domain,
+        }
+    }
+
+    /// Points the requests at a mock server; the header keeps the real host.
+    #[cfg(test)]
+    pub(crate) fn mocked(base_url: &str, locale: &Locale) -> Self {
+        Self {
+            base_url: base_url.trim_end_matches('/').to_owned(),
+            auth_domain: format!("api.amazon.{}", locale.domain),
+        }
+    }
+
+    /// The URL of an API path, e.g. `/auth/register`.
+    pub(crate) fn url(&self, path: &str) -> String {
+        format!("{}{path}", self.base_url)
+    }
+
+    /// A `POST` to an API path with the headers every identity request
+    /// carries: the `x-amzn-identity-auth-domain` host, the device's app
+    /// User-Agent and `Accept: application/json`. The register request adds
+    /// its own on top; the code-pair request sends just these.
+    pub(crate) fn post(
+        &self,
+        http: &reqwest::Client,
+        device: &Device,
+        path: &str,
+    ) -> reqwest::RequestBuilder {
+        http.post(self.url(path))
+            .header("x-amzn-identity-auth-domain", &self.auth_domain)
+            .header(reqwest::header::USER_AGENT, device.register_user_agent())
+            .header(reqwest::header::ACCEPT, "application/json")
+    }
+}
+
+/// The JSON object a response carries, or an empty object when the body is
+/// not one (Amazon's error pages are not always JSON).
+pub(crate) async fn json_object(response: reqwest::Response) -> Value {
+    match response.json::<Value>().await {
+        Ok(value) if value.is_object() => value,
+        _ => Value::Object(Default::default()),
+    }
+}
+
+/// The error Amazon's identity API sent, if any, in either shape it uses:
+/// the MAP envelope `{"response": {"error": {"code": …, "message": …}}}`
+/// (or that object at the top level) and the OAuth form `{"error": "…",
+/// "error_description": "…"}`.
+pub(crate) struct AmazonError {
+    code: Option<String>,
+    message: Option<String>,
+}
+
+impl AmazonError {
+    pub(crate) fn from_payload(payload: &Value) -> Self {
+        let text = |value: Option<&Value>| value.and_then(Value::as_str).map(str::to_owned);
+        let error = payload
+            .get("error")
+            .or_else(|| payload.pointer("/response/error"));
+        match error {
+            Some(Value::String(code)) => Self {
+                code: Some(code.clone()),
+                message: text(payload.get("error_description")),
+            },
+            Some(Value::Object(fields)) => Self {
+                code: ["code", "error_code", "error", "type"]
+                    .into_iter()
+                    .find_map(|key| text(fields.get(key))),
+                message: text(fields.get("message")),
+            },
+            _ => Self {
+                code: None,
+                message: None,
+            },
+        }
+    }
+
+    /// Whether the payload carried an error code at all (an error can also
+    /// ride in a 200 body).
+    pub(crate) fn is_present(&self) -> bool {
+        self.code.is_some()
+    }
+
+    /// "Not confirmed yet": the `Unauthorized` a device-code poll expects
+    /// until the user has entered the code.
+    pub(crate) fn is_pending(&self) -> bool {
+        self.code
+            .as_deref()
+            .is_some_and(|code| code.eq_ignore_ascii_case("Unauthorized"))
+    }
+
+    /// `HTTP 400 InvalidValue: One or more provided values are invalid`.
+    pub(crate) fn describe(&self, status: reqwest::StatusCode) -> String {
+        let mut text = format!("HTTP {}", status.as_u16());
+        if let Some(code) = &self.code {
+            text.push(' ');
+            text.push_str(code);
+        }
+        if let Some(message) = &self.message {
+            text.push_str(": ");
+            text.push_str(message);
+        }
+        text
+    }
+}
+
+/// The `POST /auth/register` body around `auth_data` — the proof of the
+/// sign-in: the OAuth `authorization_code` + PKCE verifier of the browser
+/// flows, or the confirmed code pair of the device-code flow. Everything
+/// else is the same for every login: the device identity, the app's
+/// cookies and the requested tokens.
 ///
 /// `requested_token_type` deliberately omits `store_authentication_cookie`
 /// (see the NOTE in `auth/mod.rs`). Stored website cookies are left empty;
 /// they are lazily exchanged on first cookie use (AUD-25).
-pub async fn register(
-    http: &reqwest::Client,
-    locale: &Locale,
-    device: &Device,
-    pkce: &Pkce,
-    authorization_code: &str,
-    with_username: bool,
-) -> Result<Authenticator, LoginError> {
-    let domain = locale.domain;
-    // Pre-merger Audible accounts register on the Audible host; everyone else
-    // on the Amazon host. (The website-cookie domain in the body stays
-    // `.amazon.<tld>` either way, matching the reference.)
-    let host = if with_username { "audible" } else { "amazon" };
-    let url = format!("https://api.{host}.{domain}/auth/register");
-    let body = serde_json::json!({
+pub(crate) fn registration_body(locale: &Locale, device: &Device, auth_data: Value) -> Value {
+    serde_json::json!({
         "age_info": {},
-        "auth_data": {
-            "client_id": device.client_id(),
-            "authorization_code": authorization_code,
-            "code_verifier": pkce.verifier(),
-            "code_algorithm": "SHA-256",
-            "client_domain": "DeviceLegacy",
-        },
+        "auth_data": auth_data,
         "user_context_map": { "frc": generate_frc() },
         "cookies": {
             "website_cookies": [
                 { "Name": "amzn-app-id", "Value": "MAPiOSLib/6.0/ToHideRetailLink" },
                 { "Name": "id_pk", "Value": "eyJuIjoiMSJ9" },
             ],
-            "domain": format!(".amazon.{domain}"),
+            "domain": format!(".amazon.{}", locale.domain),
         },
         "registration_data": device.registration_data(),
         "requested_extensions": ["device_info", "customer_info"],
         "requested_token_type": ["bearer", "mac_dms", "website_cookies"],
-    });
+    })
+}
 
-    let response = http
-        .post(&url)
-        .header(
-            "x-amzn-identity-auth-domain",
-            format!("api.{host}.{domain}"),
-        )
-        .header(reqwest::header::USER_AGENT, device.register_user_agent())
-        .header(reqwest::header::ACCEPT, "application/json")
+/// The register request (`POST /auth/register` with the app's headers),
+/// ready to send. Shared by the one-shot registrations and the device-code
+/// poll, which sends the same request until Amazon accepts it.
+pub(crate) fn register_request(
+    http: &reqwest::Client,
+    api: &IdentityApi,
+    locale: &Locale,
+    device: &Device,
+    body: &Value,
+) -> reqwest::RequestBuilder {
+    api.post(http, device, "/auth/register")
         .header(
             reqwest::header::ACCEPT_LANGUAGE,
             locale_language(locale.country_code),
@@ -290,23 +433,94 @@ pub async fn register(
             reqwest::header::COOKIE,
             "amzn-app-id=MAPiOSLib/6.0/ToHideRetailLink",
         )
-        .json(&body)
+        .json(body)
+}
+
+/// A register response, read: its status and JSON body. The one-shot
+/// registrations and the device-code poll both read Amazon's answer
+/// through this, so they agree on what counts as a registration and report
+/// a refusal the same way.
+pub(crate) struct RegisterReply {
+    status: reqwest::StatusCode,
+    payload: Value,
+}
+
+impl RegisterReply {
+    pub(crate) async fn read(response: reqwest::Response) -> Self {
+        let status = response.status();
+        Self {
+            status,
+            payload: json_object(response).await,
+        }
+    }
+
+    /// The registration (`response.success`) of a successful answer.
+    pub(crate) fn success(&self) -> Option<&Value> {
+        if self.status.is_success() {
+            self.payload.pointer("/response/success")
+        } else {
+            None
+        }
+    }
+
+    /// The error Amazon sent instead, if any.
+    pub(crate) fn error(&self) -> AmazonError {
+        AmazonError::from_payload(&self.payload)
+    }
+
+    /// The refusal for an error message: status plus Amazon's code and
+    /// message, e.g. `HTTP 400 InvalidValue: …`.
+    pub(crate) fn describe(&self) -> String {
+        self.error().describe(self.status)
+    }
+}
+
+/// Maps a register response onto an [`Authenticator`] — the same envelope
+/// `account import` produces. A refusal (an error status, or no
+/// `response.success` in the body) is [`LoginError::Register`] with
+/// Amazon's error code and message; a registration missing fields is
+/// [`LoginError::RegisterResponse`]. No secrets are logged.
+pub(crate) async fn authenticator_from_response(
+    locale: &Locale,
+    response: reqwest::Response,
+) -> Result<Authenticator, LoginError> {
+    let reply = RegisterReply::read(response).await;
+    match reply.success() {
+        Some(success) => build_authenticator(locale, success).await,
+        None => Err(LoginError::Register(reply.describe())),
+    }
+}
+
+/// Registers the device with Amazon (`POST /auth/register`) using the OAuth
+/// `authorization_code` of the browser flows, and maps the response onto an
+/// [`Authenticator`]. Pre-merger Audible accounts (`with_username`) register
+/// on the Audible host, everyone else on the Amazon host.
+pub async fn register(
+    http: &reqwest::Client,
+    locale: &Locale,
+    device: &Device,
+    pkce: &Pkce,
+    authorization_code: &str,
+    with_username: bool,
+) -> Result<Authenticator, LoginError> {
+    let api = IdentityApi::new(locale, with_username);
+    let auth_data = serde_json::json!({
+        "client_id": device.client_id(),
+        "authorization_code": authorization_code,
+        "code_verifier": pkce.verifier(),
+        "code_algorithm": "SHA-256",
+        "client_domain": "DeviceLegacy",
+    });
+    let body = registration_body(locale, device, auth_data);
+    let response = register_request(http, &api, locale, device, &body)
         .send()
         .await?;
-    if !response.status().is_success() {
-        return Err(LoginError::Register(response.status()));
-    }
-    let payload: Value = response.json().await?;
-    let success = payload
-        .get("response")
-        .and_then(|response| response.get("success"))
-        .ok_or(LoginError::RegisterResponse)?;
-    build_authenticator(locale, success).await
+    authenticator_from_response(locale, response).await
 }
 
 /// Maps the register `response.success` onto the grouped auth data and builds
 /// an [`Authenticator`]. The device private key is normalized to PKCS#1 PEM.
-async fn build_authenticator(
+pub(crate) async fn build_authenticator(
     locale: &Locale,
     success: &Value,
 ) -> Result<Authenticator, LoginError> {
@@ -327,12 +541,8 @@ async fn build_authenticator(
     let raw_key = str_field(mac_dms, "device_private_key")?.to_owned();
     let pem = normalize_private_key(raw_key).await?;
 
-    let expires_in = match bearer.get("expires_in") {
-        Some(Value::Number(n)) => n.as_f64(),
-        Some(Value::String(s)) => s.parse().ok(),
-        _ => None,
-    }
-    .ok_or(LoginError::RegisterResponse)?;
+    let expires_in =
+        crate::timefmt::json_secs(bearer.get("expires_in")).ok_or(LoginError::RegisterResponse)?;
     let now = crate::timefmt::now_unix();
 
     // identity = customer_info with user_id renamed to customer_id; unknown
@@ -466,6 +676,133 @@ mod tests {
         assert!(url.starts_with("https://www.audible.de/ap/signin?"));
         assert!(url.contains("openid.assoc_handle=amzn_audible_android_experiment_lap_de"));
         assert!(url.contains("pageId=amzn_audible_android_privatepool"));
+    }
+
+    #[test]
+    fn identity_api_hosts_per_account_kind() {
+        let uk = locale::find("uk").unwrap();
+        let amazon = IdentityApi::new(&uk, false);
+        assert_eq!(
+            amazon.url("/auth/register"),
+            "https://api.amazon.co.uk/auth/register"
+        );
+        assert_eq!(amazon.auth_domain, "api.amazon.co.uk");
+        let audible = IdentityApi::new(&uk, true);
+        assert_eq!(
+            audible.url("/auth/register"),
+            "https://api.audible.co.uk/auth/register"
+        );
+        assert_eq!(audible.auth_domain, "api.audible.co.uk");
+        // A mock keeps the real header host.
+        let mocked = IdentityApi::mocked("http://127.0.0.1:1/", &uk);
+        assert_eq!(
+            mocked.url("/auth/register"),
+            "http://127.0.0.1:1/auth/register"
+        );
+        assert_eq!(mocked.auth_domain, "api.amazon.co.uk");
+    }
+
+    #[test]
+    fn registration_body_wraps_the_auth_data() {
+        let device = Device::generate(DeviceKind::IPhone);
+        let de = locale::find("de").unwrap();
+        let body = registration_body(&de, &device, serde_json::json!({ "proof": "x" }));
+        assert_eq!(body["auth_data"]["proof"], "x");
+        assert_eq!(body["registration_data"]["device_serial"], device.serial());
+        assert_eq!(body["cookies"]["domain"], ".amazon.de");
+        assert_eq!(
+            body["requested_token_type"],
+            serde_json::json!(["bearer", "mac_dms", "website_cookies"])
+        );
+        assert!(
+            body["user_context_map"]["frc"]
+                .as_str()
+                .is_some_and(|frc| !frc.is_empty())
+        );
+    }
+
+    #[test]
+    fn amazon_errors_are_read_in_every_shape() {
+        use reqwest::StatusCode;
+        use serde_json::json;
+        let describe =
+            |payload: Value| AmazonError::from_payload(&payload).describe(StatusCode::BAD_REQUEST);
+        assert_eq!(
+            describe(
+                json!({ "response": { "error": { "code": "InvalidValue", "message": "bad" } } })
+            ),
+            "HTTP 400 InvalidValue: bad"
+        );
+        assert_eq!(
+            describe(json!({ "error": { "error_code": "Throttled" } })),
+            "HTTP 400 Throttled"
+        );
+        assert_eq!(
+            describe(json!({ "error": { "type": "ServerError", "message": "later" } })),
+            "HTTP 400 ServerError: later"
+        );
+        assert_eq!(
+            describe(json!({ "error": "invalid_request", "error_description": "no" })),
+            "HTTP 400 invalid_request: no"
+        );
+        assert_eq!(describe(json!({ "error": null })), "HTTP 400");
+        assert_eq!(describe(json!({})), "HTTP 400");
+        assert!(
+            AmazonError::from_payload(
+                &json!({ "response": { "error": { "code": "UNAUTHORIZED" } } })
+            )
+            .is_pending()
+        );
+        assert!(
+            !AmazonError::from_payload(&json!({ "error": "unauthorized_client" })).is_pending()
+        );
+        assert!(!AmazonError::from_payload(&json!({})).is_present());
+    }
+
+    /// A refused registration (the browser flows' one-shot register) now
+    /// carries Amazon's error code and message, not just the status.
+    #[tokio::test]
+    async fn a_refused_registration_reports_amazons_error() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/auth/register"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "response": { "error": {
+                    "code": "InvalidValue",
+                    "message": "One or more provided values are invalid",
+                } },
+            })))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/auth/register"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("<html>down</html>"))
+            .mount(&server)
+            .await;
+
+        let de = locale::find("de").unwrap();
+        let device = Device::generate(DeviceKind::IPhone);
+        let api = IdentityApi::mocked(&server.uri(), &de);
+        let body = registration_body(&de, &device, serde_json::json!({}));
+        let http = reqwest::Client::new();
+        for expected in [
+            "device registration failed (HTTP 400 InvalidValue: One or more provided values are invalid)",
+            "device registration failed (HTTP 503)",
+        ] {
+            let response = register_request(&http, &api, &de, &device, &body)
+                .send()
+                .await
+                .unwrap();
+            let error = authenticator_from_response(&de, response)
+                .await
+                .unwrap_err();
+            assert!(matches!(error, LoginError::Register(_)));
+            assert_eq!(error.to_string(), expected);
+        }
     }
 
     #[test]
