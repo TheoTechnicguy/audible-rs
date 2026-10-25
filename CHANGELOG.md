@@ -9,6 +9,12 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 This file is generated from the commit history by [git-cliff](https://git-cliff.org)
 — do not edit it by hand (see `cliff.toml`).
 
+## [0.1.0-alpha.10](https://github.com/mkb79/audible-rs/compare/v0.1.0-alpha.9..v0.1.0-alpha.10) - 2026-10-25
+
+### Added
+
+- *fairplay*: Add the experimental macOS-only audible fairplay command ([#133](https://github.com/mkb79/audible-rs/pull/133)) ([9956ac4](https://github.com/mkb79/audible-rs/commit/9956ac4e8682a33113bcf94bd82b8ccdcf6eb512))
+
 ## [0.1.0-alpha.9](https://github.com/mkb79/audible-rs/compare/v0.1.0-alpha.8..v0.1.0-alpha.9) - 2026-10-24
 
 ### Added
